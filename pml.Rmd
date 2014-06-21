@@ -1,0 +1,175 @@
+
+Predicting exercise from sensor data
+========================================================
+
+Author: Minkoo Seo (minkoo.seo@gmail.com)
+
+This is the review on the method I have used to build a model to predict exercise type using the Human Activity Data(see the section on the Weight Lifting Exercise Dataset)[1]. Model built has shown 0.42% OOB estimate of  error rate during training and 100% accuracy for validation and testing data.
+
+Preparation
+---------------------
+For this machine learning task, I decided to use caret and doMC(for parallelism).
+
+```{r results='hide', message=FALSE, warning=FALSE, cache=FALSE}
+library(caret)
+library(doMC)
+registerDoMC(cores=8)
+```
+
+Preprocessing
+----------------------
+
+When looking at the training data in the spreadsheet, it was observed that many columns are empty or filled with many NAs. So I've decided to delete such columns and wrote a function to do that easily.
+
+```{r cache=TRUE}
+training <- read.csv("pml-training.csv")
+testing <- read.csv("pml-testing.csv")
+remove_columns <- function(df, cols_to_remove) {
+  return(df[, -which(names(df) %in% cols_to_remove)])
+}
+```
+
+First thing to remove was time related columns as they don't affect exercise class. Among them, new_window looked promising as it may signify the starting point of an exercise. But I've decided to exclude it to start with simple features.
+
+```{r cache=TRUE}
+time_columns <- c("raw_timestamp_part_1", 
+                  "raw_timestamp_part_2", 
+                  "cvtd_timestamp",  
+                  "new_window",	
+                  "num_window")
+training <- remove_columns(training, time_columns)
+testing <- remove_columns(testing, time_columns)
+```
+
+Next, columns without enough variance were deleted as such features are useless most of the time.
+```{r cache=TRUE}
+zero_columns <- nearZeroVar(training)
+training <- training[, -zero_columns]
+testing <- testing[, -zero_columns]
+```
+
+When looking at NA columns, it was obvious that most of values are just NAs. For example, take a look at max_roll_dumbbell.
+```{r cache=TRUE}
+sum(is.na(training$max_roll_dumbbell))
+sum(!is.na(training$max_roll_dumbbell))
+```
+
+It means that imputation may not help as most of values in such columns will be filled with imputed values. So, columns with any NA were excluded.
+```{r cache=TRUE}
+na_columns <- names(training)[which(
+  sapply(names(training), function(col_name) { sum(is.na(training[, col_name])) != 0 }))]
+training <- remove_columns(training, na_columns)
+testing <- remove_columns(testing, na_columns)
+```
+
+Finally, I deleted columns with IDs. Testing data obviously had user_name in it. So, there's a room for building per user model, but I decided not to do that for the beginning.
+```{r cache=TRUE}
+id_columns <- c("X", "user_name")
+training <- remove_columns(training, id_columns)
+testing <- remove_columns(testing, id_columns)
+```
+
+
+Model Building
+============================================
+
+Validation Data
+---------------
+
+First thing to do was to take some of training data out as validation. (Note: I'm using the term 'validation data' to designate the data used for the verification of model before final prediction. This is the different definition of the 'validation data' from the lecture but it's the definition used outside of the medical machine learning. See [Train, Validate and Test for Data Mining in JMP](http://blogs.sas.com/content/jmp/2010/07/06/train-validate-and-test-for-data-mining-in-jmp/) as an example.) It would have been better if I had  done this in the beginning of the work. But I didn't use validation data very much during preprocessing anyway.
+
+```{r cache=TRUE}
+in_train <- createDataPartition(training$classe, 
+                                p=(NROW(training) - NROW(testing))/NROW(training), 
+                                list=FALSE)
+validation <- training[-in_train, ]
+training <- training[in_train, ]
+NROW(training)
+NROW(validation)
+NROW(testing)
+```
+
+
+Base Random Forest Model
+-------------------------
+Random forest seemd to be appropriate for this task because of the following reasons:
+1. Random forest usually shows good performance.
+2. There are no NA in my data. (R's randomForest doesn't work with NAs).
+3. Random forest captures interaction among variables which I didn't take care of in the pre-processing.
+
+Even the first trial gave me satisfying result. (Note: seeds=NULL in trainControl() sets the seed to random integers automatically. Thanks to cache=TRUE chunk option in R Markdown, this seed set is preserved across the runs of the code.)
+
+Here and the below, I have relied on the default trainControl() which uses 25 repetitions of bootstrapped samples for the purpose of cross validation like evaluation.
+
+```{r cache=TRUE, message=FALSE, warning=FALSE}
+random_seed_control <- trainControl(seeds=NULL)
+rf_base <- train(classe ~ ., data=training, method="rf", trControl=random_seed_control)
+rf_base$results
+```
+
+
+Downsampling Random Forest model
+--------------------------------
+Though the base model looked good, there was a problem in training$classes. Class 'A' had more data than the others. Classifier built on such data is likely to predict 'A' more often than the others, as it gives higher accuracy. 
+```{r cache=TRUE}
+table(training$classe)
+```
+
+One can verify this by looking at the confusion matrix. Class 'A' has lower errors than the others, meaning that classifier predicts data's class as 'A' more often than the others.
+```{r cache=TRUE}
+rf_base$finalModel
+```
+
+To address this, stratified sampling can be used. In this scheme, data is sampled from each strata (which is class) and the sample size for each class is the minimum of the number of data in all classes. In other words, we get min(table(training$classe)) samples from each class. This is called down sampling[2] as we sample less from classes with more data.
+```{r cache=TRUE}
+rf_strata <- train(classe ~ ., data=training, method="rf", trControl=random_seed_control,
+                   strata=training$classe, sampsize=rep(min(table(training$classe)), 5))
+rf_strata$results
+```
+
+This new model has lower error for 'D' but higher errors for others. Still, the overall OOB error rate stayed the same. It's 0.42% for both of rf_base and rf_strata.
+```{r cache=TRUE}
+rf_strata$finalModel
+```
+
+
+PCA
+---
+Covariates are all numeric, thus it seemed like maybe PCA can help. To verify that, PCA preprocessing was applied.
+
+```{r cache=TRUE}
+rf_strata_pca <- train(classe ~ ., data=training, method="rf", trControl=random_seed_control,
+                       preProcess="pca",                         
+                       strata=training$classe, sampsize=rep(min(table(training$classe)), 5))
+rf_strata_pca$results
+```
+
+But it's performance was lower than the previous two models.
+
+
+Validation
+===========
+To test the goodness of the models built so far, confusion matrices for validation data were calculated.
+
+```{r cache=TRUE}
+confusionMatrix(predict(rf_base, newdata=validation), validation$classe)$table
+confusionMatrix(predict(rf_strata, newdata=validation), validation$classe)$table
+confusionMatrix(predict(rf_strata_pca, newdata=validation), validation$classe)$table
+```
+
+All of them has shown the perfect performance.
+
+
+Testing
+=======
+Finally, predictions were made using the three models.
+```{r cache=TRUE}
+(p_base <- predict(rf_base, newdata=testing))
+(p_strata <- predict(rf_strata, newdata=testing))
+(p_strata_pca <- predict(rf_strata_pca, newdata=testing))
+
+all.equal(p_base, p_strata)
+all.equal(p_base, p_strata_pca)
+```
+
+As shown above, rf_base and rf_strata has shown the same results while PCA version has one different prediction. So I used the results from rf_base and rf_strata.
